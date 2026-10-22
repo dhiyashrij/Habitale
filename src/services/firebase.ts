@@ -1,0 +1,160 @@
+import { initializeApp, getApps, getApp, type FirebaseApp } from 'firebase/app';
+import {
+  getAuth,
+  GoogleAuthProvider,
+  signInWithPopup,
+  signOut as fbSignOut,
+  type Auth,
+  type User,
+} from 'firebase/auth';
+import type { Firestore } from 'firebase/firestore';
+import type { FirebaseConfigState } from '../types';
+
+/**
+ * Firebase Web App Configuration for project habitale28
+ *
+ * Reads values directly from Vite environment variables (VITE_FIREBASE_*).
+ * Never uses invented or placeholder API keys.
+ */
+const env = import.meta.env;
+
+const rawApiKey = (env.VITE_FIREBASE_API_KEY || '').trim();
+const rawProjectId = (env.VITE_FIREBASE_PROJECT_ID || 'habitale28').trim();
+const rawAuthDomain = (
+  env.VITE_FIREBASE_AUTH_DOMAIN ||
+  (rawProjectId ? `${rawProjectId}.firebaseapp.com` : '')
+).trim();
+const rawStorageBucket = (
+  env.VITE_FIREBASE_STORAGE_BUCKET ||
+  (rawProjectId ? `${rawProjectId}.firebasestorage.app` : '')
+).trim();
+const rawMessagingSenderId = (env.VITE_FIREBASE_MESSAGING_SENDER_ID || '').trim();
+const rawAppId = (env.VITE_FIREBASE_APP_ID || '').trim();
+
+// A valid Firebase API key must be non-empty and not a placeholder string
+const isValidApiKey = Boolean(
+  rawApiKey &&
+    !rawApiKey.includes('placeholder') &&
+    !rawApiKey.includes('your_') &&
+    !rawApiKey.includes('AIzaSyB_HabitaleApp')
+);
+
+export const firebaseConfig: FirebaseConfigState = {
+  apiKey: rawApiKey,
+  authDomain: rawAuthDomain,
+  projectId: rawProjectId,
+  storageBucket: rawStorageBucket,
+  messagingSenderId: rawMessagingSenderId,
+  appId: rawAppId,
+  isConfigured: isValidApiKey && Boolean(rawProjectId),
+};
+
+export function getStoredFirebaseConfig(): FirebaseConfigState {
+  return firebaseConfig;
+}
+
+// Singleton instances - initialized exactly once
+let appInstance: FirebaseApp | null = null;
+let authInstance: Auth | null = null;
+
+if (firebaseConfig.isConfigured) {
+  try {
+    appInstance =
+      getApps().length > 0
+        ? getApp()
+        : initializeApp({
+            apiKey: firebaseConfig.apiKey,
+            authDomain: firebaseConfig.authDomain,
+            projectId: firebaseConfig.projectId,
+            storageBucket: firebaseConfig.storageBucket,
+            messagingSenderId: firebaseConfig.messagingSenderId,
+            appId: firebaseConfig.appId,
+          });
+
+    authInstance = getAuth(appInstance);
+  } catch (error) {
+    console.error('Failed to initialize Firebase singleton:', error);
+    appInstance = null;
+    authInstance = null;
+  }
+}
+
+export const auth: Auth | null = authInstance;
+export const db: Firestore | null = null;
+export const isReady: boolean = Boolean(authInstance);
+
+export function initializeFirebaseApp(): {
+  app: FirebaseApp | null;
+  auth: Auth | null;
+  db: Firestore | null;
+  isReady: boolean;
+} {
+  return {
+    app: appInstance,
+    auth: authInstance,
+    db: null,
+    isReady: Boolean(authInstance),
+  };
+}
+
+/**
+ * Maps Firebase Auth errors to clear, friendly user explanations
+ */
+export function formatFirebaseAuthError(error: unknown): string {
+  if (!error || typeof error !== 'object') {
+    return 'An unexpected error occurred during sign in. Please try again.';
+  }
+
+  const err = error as { code?: string; message?: string };
+
+  if (err.message === 'CONFIG_MISSING') {
+    return 'Firebase API key is missing. Please add your Firebase Web App credentials for project "habitale28" to the local .env file.';
+  }
+
+  switch (err.code) {
+    case 'auth/popup-closed-by-user':
+      return 'Sign-in cancelled. The Google sign-in window was closed before completing.';
+    case 'auth/cancelled-popup-request':
+      return 'Another sign-in request was started. Please try again.';
+    case 'auth/popup-blocked':
+      return 'The sign-in popup was blocked by your browser. Please allow popups for this page.';
+    case 'auth/unauthorized-domain':
+      return 'This domain (e.g. localhost) is not authorized in your Firebase project. In Firebase Console, go to Authentication > Settings > Authorized domains and ensure localhost is listed.';
+    case 'auth/operation-not-allowed':
+      return 'Google sign-in is not enabled in your Firebase Console. Go to Authentication > Sign-in method and enable Google.';
+    case 'auth/invalid-api-key':
+    case 'auth/api-key-not-valid':
+      return 'The configured Firebase API key is invalid. Please check your VITE_FIREBASE_API_KEY in .env.';
+    case 'auth/network-request-failed':
+      return 'A network error occurred. Please check your internet connection.';
+    case 'auth/user-disabled':
+      return 'This user account has been disabled.';
+    case 'auth/internal-error':
+      return 'Firebase internal error. Please check your Firebase Console project settings.';
+    default:
+      return err.message || 'Failed to authenticate with Google. Please check your configuration.';
+  }
+}
+
+/**
+ * Initiates real Google sign-in via Firebase popup using the single initialized auth instance
+ */
+export async function signInWithGooglePopup(): Promise<User> {
+  if (!authInstance) {
+    throw new Error('CONFIG_MISSING');
+  }
+
+  const provider = new GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: 'select_account' });
+  const result = await signInWithPopup(authInstance, provider);
+  return result.user;
+}
+
+/**
+ * Signs out from Firebase using the single initialized auth instance
+ */
+export async function signOutFirebase(): Promise<void> {
+  if (authInstance) {
+    await fbSignOut(authInstance);
+  }
+}
