@@ -7,14 +7,14 @@ import {
   type Auth,
   type User,
 } from 'firebase/auth';
-import type { Firestore } from 'firebase/firestore';
+import { getFirestore, type Firestore } from 'firebase/firestore';
 import type { FirebaseConfigState } from '../types';
 
 /**
  * Firebase Web App Configuration for project habitale28
  *
  * Reads values directly from Vite environment variables (VITE_FIREBASE_*).
- * Never uses invented or placeholder API keys.
+ * Uses import.meta.env exclusively (standard for Vite).
  */
 const env = import.meta.env;
 
@@ -30,6 +30,7 @@ const rawStorageBucket = (
 ).trim();
 const rawMessagingSenderId = (env.VITE_FIREBASE_MESSAGING_SENDER_ID || '').trim();
 const rawAppId = (env.VITE_FIREBASE_APP_ID || '').trim();
+const rawMeasurementId = (env.VITE_FIREBASE_MEASUREMENT_ID || '').trim();
 
 // A valid Firebase API key must be non-empty and not a placeholder string
 const isValidApiKey = Boolean(
@@ -46,8 +47,21 @@ export const firebaseConfig: FirebaseConfigState = {
   storageBucket: rawStorageBucket,
   messagingSenderId: rawMessagingSenderId,
   appId: rawAppId,
+  measurementId: rawMeasurementId || undefined,
   isConfigured: isValidApiKey && Boolean(rawProjectId),
 };
+
+export function validateFirebaseConfig(): { isValid: boolean; missingKeys: string[] } {
+  const missing: string[] = [];
+  if (!rawApiKey || !isValidApiKey) missing.push('VITE_FIREBASE_API_KEY');
+  if (!rawProjectId) missing.push('VITE_FIREBASE_PROJECT_ID');
+  if (!rawAppId) missing.push('VITE_FIREBASE_APP_ID');
+
+  return {
+    isValid: missing.length === 0,
+    missingKeys: missing,
+  };
+}
 
 export function getStoredFirebaseConfig(): FirebaseConfigState {
   return firebaseConfig;
@@ -56,32 +70,7 @@ export function getStoredFirebaseConfig(): FirebaseConfigState {
 // Singleton instances - initialized exactly once
 let appInstance: FirebaseApp | null = null;
 let authInstance: Auth | null = null;
-
-if (firebaseConfig.isConfigured) {
-  try {
-    appInstance =
-      getApps().length > 0
-        ? getApp()
-        : initializeApp({
-            apiKey: firebaseConfig.apiKey,
-            authDomain: firebaseConfig.authDomain,
-            projectId: firebaseConfig.projectId,
-            storageBucket: firebaseConfig.storageBucket,
-            messagingSenderId: firebaseConfig.messagingSenderId,
-            appId: firebaseConfig.appId,
-          });
-
-    authInstance = getAuth(appInstance);
-  } catch (error) {
-    console.error('Failed to initialize Firebase singleton:', error);
-    appInstance = null;
-    authInstance = null;
-  }
-}
-
-export const auth: Auth | null = authInstance;
-export const db: Firestore | null = null;
-export const isReady: boolean = Boolean(authInstance);
+let dbInstance: Firestore | null = null;
 
 export function initializeFirebaseApp(): {
   app: FirebaseApp | null;
@@ -89,13 +78,51 @@ export function initializeFirebaseApp(): {
   db: Firestore | null;
   isReady: boolean;
 } {
+  if (!appInstance && firebaseConfig.isConfigured) {
+    try {
+      appInstance =
+        getApps().length > 0
+          ? getApp()
+          : initializeApp({
+              apiKey: firebaseConfig.apiKey,
+              authDomain: firebaseConfig.authDomain,
+              projectId: firebaseConfig.projectId,
+              storageBucket: firebaseConfig.storageBucket,
+              messagingSenderId: firebaseConfig.messagingSenderId,
+              appId: firebaseConfig.appId,
+              ...(firebaseConfig.measurementId ? { measurementId: firebaseConfig.measurementId } : {}),
+            });
+
+      authInstance = getAuth(appInstance);
+
+      try {
+        dbInstance = getFirestore(appInstance);
+      } catch (err) {
+        console.warn('Optional Firestore initialization deferred:', err);
+        dbInstance = null;
+      }
+    } catch (error) {
+      console.error('Failed to initialize Firebase singleton:', error);
+      appInstance = null;
+      authInstance = null;
+      dbInstance = null;
+    }
+  }
+
   return {
     app: appInstance,
     auth: authInstance,
-    db: null,
+    db: dbInstance,
     isReady: Boolean(authInstance),
   };
 }
+
+// Initial bootstrap
+initializeFirebaseApp();
+
+export const auth: Auth | null = authInstance;
+export const db: Firestore | null = dbInstance;
+export const isReady: boolean = Boolean(authInstance);
 
 /**
  * Maps Firebase Auth errors to clear, friendly user explanations
@@ -108,6 +135,10 @@ export function formatFirebaseAuthError(error: unknown): string {
   const err = error as { code?: string; message?: string };
 
   if (err.message === 'CONFIG_MISSING') {
+    const validation = validateFirebaseConfig();
+    if (validation.missingKeys.length > 0) {
+      return `Firebase configuration is incomplete. Missing or invalid: ${validation.missingKeys.join(', ')}. Please check your local .env file.`;
+    }
     return 'Firebase API key is missing. Please add your Firebase Web App credentials for project "habitale28" to the local .env file.';
   }
 
@@ -140,13 +171,14 @@ export function formatFirebaseAuthError(error: unknown): string {
  * Initiates real Google sign-in via Firebase popup using the single initialized auth instance
  */
 export async function signInWithGooglePopup(): Promise<User> {
-  if (!authInstance) {
+  const { auth: currentAuth } = initializeFirebaseApp();
+  if (!currentAuth) {
     throw new Error('CONFIG_MISSING');
   }
 
   const provider = new GoogleAuthProvider();
   provider.setCustomParameters({ prompt: 'select_account' });
-  const result = await signInWithPopup(authInstance, provider);
+  const result = await signInWithPopup(currentAuth, provider);
   return result.user;
 }
 
@@ -154,7 +186,8 @@ export async function signInWithGooglePopup(): Promise<User> {
  * Signs out from Firebase using the single initialized auth instance
  */
 export async function signOutFirebase(): Promise<void> {
-  if (authInstance) {
-    await fbSignOut(authInstance);
+  const { auth: currentAuth } = initializeFirebaseApp();
+  if (currentAuth) {
+    await fbSignOut(currentAuth);
   }
 }

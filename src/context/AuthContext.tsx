@@ -1,8 +1,8 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import type { UserProfile } from '../types';
 import {
-  auth,
   isReady as isFirebaseReady,
+  initializeFirebaseApp,
   signInWithGooglePopup,
   signOutFirebase,
   formatFirebaseAuthError,
@@ -42,12 +42,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   // Listen to real Firebase Auth state changes
   useEffect(() => {
-    if (!auth || !isFirebaseReady) {
+    const { auth: activeAuth, isReady } = initializeFirebaseApp();
+    if (!activeAuth || !isReady) {
       setIsLoading(false);
       return;
     }
 
-    const unsubscribe = onAuthStateChanged(auth, (fbUser) => {
+    const unsubscribe = onAuthStateChanged(activeAuth, (fbUser) => {
       if (fbUser) {
         setFirebaseUser(fbUser);
         const storageKey = `habitale_profile_${fbUser.uid}`;

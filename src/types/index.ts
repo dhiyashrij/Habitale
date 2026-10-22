@@ -151,6 +151,7 @@ export interface FirebaseConfigState {
   storageBucket: string;
   messagingSenderId: string;
   appId: string;
+  measurementId?: string;
   isConfigured: boolean;
 }
 
