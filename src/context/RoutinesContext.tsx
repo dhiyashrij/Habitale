@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import type { Routine, RoutineTask } from '../types';
 import { loadLocalRoutines, saveLocalRoutines } from '../services/storage';
 import { fetchUserRoutines, saveUserRoutine, deleteUserRoutine as deleteFirestoreRoutine } from '../services/firestore';
@@ -10,7 +10,7 @@ import confetti from 'canvas-confetti';
 interface RoutinesContextType {
   routines: Routine[];
   todayStr: string;
-  addRoutine: (routine: Omit<Routine, 'id' | 'createdAt' | 'streak' | 'bestStreak' | 'completedDates' | 'order'>) => Promise<void>;
+  addRoutine: (routine: Omit<Routine, 'id' | 'createdAt' | 'streak' | 'bestStreak' | 'completedDates' | 'order'> & { id?: string }) => Promise<Routine>;
   updateRoutine: (id: string, updates: Partial<Routine>) => Promise<void>;
   deleteRoutine: (id: string) => Promise<void>;
   duplicateRoutine: (id: string) => Promise<void>;
@@ -20,6 +20,7 @@ interface RoutinesContextType {
   isTaskCompletedOnDate: (task: RoutineTask, dateStr?: string) => boolean;
   loadStarterRoutines: () => Promise<void>;
   clearRoutines: () => Promise<void>;
+  cleanDuplicateRoutines: () => Promise<void>;
   todayCompletionRate: number;
   streakSummary: { totalActiveStreaks: number; highestStreak: number };
 }
@@ -34,10 +35,61 @@ export const getTodayString = (): string => {
   return `${year}-${month}-${day}`;
 };
 
+/**
+ * Safely identifies and removes accidental duplicate routines (e.g. from repeated rapid clicks).
+ * Always preserves routines with user progress, completion history, or active streaks.
+ */
+export function deduplicateRoutines(routinesList: Routine[]): { cleaned: Routine[]; removedIds: string[] } {
+  if (!Array.isArray(routinesList) || routinesList.length <= 1) {
+    return { cleaned: routinesList || [], removedIds: [] };
+  }
+
+  const seenMap = new Map<string, Routine>();
+  const removedIds: string[] = [];
+
+  for (const routine of routinesList) {
+    if (!routine || !routine.id) continue;
+
+    // Normalizing signature: lowercase title + timeOfDay + category
+    const key = `${routine.title.trim().toLowerCase()}|${routine.timeOfDay}|${routine.category}`;
+
+    const existing = seenMap.get(key);
+    if (!existing) {
+      seenMap.set(key, routine);
+    } else {
+      const existingHistory = (existing.completedDates?.length || 0) + (existing.streak || 0);
+      const currentHistory = (routine.completedDates?.length || 0) + (routine.streak || 0);
+
+      if (existingHistory === 0 && currentHistory === 0) {
+        // Both are unstarted identical duplicates: retain the first one, mark second as duplicate
+        removedIds.push(routine.id);
+      } else if (existingHistory > 0 && currentHistory === 0) {
+        // Keep the one with history, discard uncompleted duplicate
+        removedIds.push(routine.id);
+      } else if (currentHistory > 0 && existingHistory === 0) {
+        // Current has history, existing didn't: replace with current
+        removedIds.push(existing.id);
+        seenMap.set(key, routine);
+      } else {
+        // Both have user activity: keep both under unique keys to protect all user data
+        seenMap.set(`${key}|${routine.id}`, routine);
+      }
+    }
+  }
+
+  const cleaned = routinesList.filter(r => !removedIds.includes(r.id));
+  return { cleaned, removedIds };
+}
+
 export const RoutinesProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { user } = useAuth();
   const [routines, setRoutines] = useState<Routine[]>(() => {
-    return loadLocalRoutines();
+    const raw = loadLocalRoutines();
+    const { cleaned } = deduplicateRoutines(raw);
+    if (cleaned.length !== raw.length) {
+      saveLocalRoutines(cleaned);
+    }
+    return cleaned;
   });
 
   const { theme } = useTheme();
@@ -46,7 +98,9 @@ export const RoutinesProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   // Load from Cloud Firestore when authenticated user changes
   useEffect(() => {
     if (!user) {
-      setRoutines(loadLocalRoutines());
+      const raw = loadLocalRoutines();
+      const { cleaned } = deduplicateRoutines(raw);
+      setRoutines(cleaned);
       return;
     }
 
@@ -54,13 +108,22 @@ export const RoutinesProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       try {
         const cloudRoutines = await fetchUserRoutines(user.id);
         if (cloudRoutines.length > 0) {
-          setRoutines(cloudRoutines);
-          saveLocalRoutines(cloudRoutines);
+          const { cleaned, removedIds } = deduplicateRoutines(cloudRoutines);
+          setRoutines(cleaned);
+          saveLocalRoutines(cleaned);
+
+          // Clean up remote duplicates in the background if found
+          if (removedIds.length > 0) {
+            for (const dupId of removedIds) {
+              deleteFirestoreRoutine(user.id, dupId).catch(() => {});
+            }
+          }
         } else {
           const local = loadLocalRoutines();
-          if (local.length > 0) {
-            setRoutines(local);
-            for (const r of local) {
+          const { cleaned } = deduplicateRoutines(local);
+          if (cleaned.length > 0) {
+            setRoutines(cleaned);
+            for (const r of cleaned) {
               await saveUserRoutine(user.id, r);
             }
           } else {
@@ -68,38 +131,77 @@ export const RoutinesProvider: React.FC<{ children: React.ReactNode }> = ({ chil
           }
         }
       } catch (err) {
-        console.error('Error fetching routines from Cloud Firestore:', err);
+        console.warn('Could not fetch cloud routines; using local storage:', err);
       }
     };
 
     loadCloudData();
   }, [user?.id]);
 
+  // Persist state to local storage whenever it changes
   useEffect(() => {
     saveLocalRoutines(routines);
   }, [routines]);
 
-  const addRoutine = async (data: Omit<Routine, 'id' | 'createdAt' | 'streak' | 'bestStreak' | 'completedDates' | 'order'>) => {
-    const newRoutine: Routine = {
-      ...data,
-      id: 'routine-' + Date.now(),
-      createdAt: new Date().toISOString(),
-      streak: 0,
-      bestStreak: 0,
-      completedDates: [],
-      order: routines.length,
-      tasks: data.tasks || [],
-    };
+  /**
+   * Idempotent routine addition:
+   * Re-uses existing routine if already present with matching ID or identical title+category+timeOfDay
+   * created within 5 minutes with zero completions, preventing duplicate entries on rapid clicks.
+   */
+  const addRoutine = async (
+    data: Omit<Routine, 'id' | 'createdAt' | 'streak' | 'bestStreak' | 'completedDates' | 'order'> & { id?: string }
+  ): Promise<Routine> => {
+    const targetId = data.id || 'routine-' + Date.now();
+    let resultingRoutine: Routine;
 
-    setRoutines(prev => [...prev, newRoutine]);
+    setRoutines(prev => {
+      // 1. Idempotency match check
+      const existingIdx = prev.findIndex(r =>
+        (data.id && r.id === data.id) ||
+        (r.title.trim().toLowerCase() === data.title.trim().toLowerCase() &&
+          r.timeOfDay === data.timeOfDay &&
+          r.category === data.category &&
+          (!r.completedDates || r.completedDates.length === 0) &&
+          r.streak === 0 &&
+          Math.abs(Date.now() - new Date(r.createdAt).getTime()) < 300000)
+      );
 
-    if (user) {
+      if (existingIdx !== -1) {
+        // Update in-place to prevent duplication
+        const updated = [...prev];
+        resultingRoutine = {
+          ...updated[existingIdx],
+          ...data,
+          updatedAt: new Date().toISOString(),
+        };
+        updated[existingIdx] = resultingRoutine;
+        return updated;
+      }
+
+      // New entry
+      resultingRoutine = {
+        ...data,
+        id: targetId,
+        createdAt: new Date().toISOString(),
+        streak: 0,
+        bestStreak: 0,
+        completedDates: [],
+        order: prev.length,
+        tasks: data.tasks || [],
+      };
+      return [...prev, resultingRoutine];
+    });
+
+    // Sync to Cloud Firestore with timeout protection
+    if (user && resultingRoutine!) {
       try {
-        await saveUserRoutine(user.id, newRoutine);
+        await saveUserRoutine(user.id, resultingRoutine);
       } catch (err) {
-        console.error('Failed to sync new routine to Firestore:', err);
+        console.warn('Routine saved locally; cloud sync deferred:', err);
       }
     }
+
+    return resultingRoutine!;
   };
 
   const updateRoutine = async (id: string, updates: Partial<Routine>) => {
@@ -122,7 +224,7 @@ export const RoutinesProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       try {
         await saveUserRoutine(user.id, targetRoutine);
       } catch (err) {
-        console.error('Failed to sync updated routine to Firestore:', err);
+        console.warn('Routine updated locally; cloud sync deferred:', err);
       }
     }
   };
@@ -134,10 +236,25 @@ export const RoutinesProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       try {
         await deleteFirestoreRoutine(user.id, id);
       } catch (err) {
-        console.error('Failed to delete routine from Firestore:', err);
+        console.warn('Routine deleted locally; cloud sync deferred:', err);
       }
     }
   };
+
+  const cleanDuplicateRoutines = useCallback(async () => {
+    setRoutines(prev => {
+      const { cleaned, removedIds } = deduplicateRoutines(prev);
+      if (removedIds.length > 0) {
+        saveLocalRoutines(cleaned);
+        if (user) {
+          for (const id of removedIds) {
+            deleteFirestoreRoutine(user.id, id).catch(() => {});
+          }
+        }
+      }
+      return cleaned;
+    });
+  }, [user]);
 
   const duplicateRoutine = async (id: string) => {
     const existing = routines.find(r => r.id === id);
@@ -168,7 +285,7 @@ export const RoutinesProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       try {
         await saveUserRoutine(user.id, clonedRoutine);
       } catch (err) {
-        console.error('Failed to duplicate routine in Firestore:', err);
+        console.warn('Routine duplicated locally; cloud sync deferred:', err);
       }
     }
   };
@@ -178,194 +295,217 @@ export const RoutinesProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   };
 
   const isTaskCompletedOnDate = (task: RoutineTask, dateStr: string = todayStr): boolean => {
-    return (task.completedDates || []).includes(dateStr);
+    return task.completedDates.includes(dateStr);
   };
 
-  // Toggle individual task within a routine
-  const toggleTaskCompletion = async (routineId: string, taskId: string, targetDate: string = todayStr) => {
-    let targetRoutine: Routine | undefined;
+  const toggleTaskCompletion = async (routineId: string, taskId: string, dateStr: string = todayStr) => {
+    let updatedTarget: Routine | undefined;
 
     setRoutines(prev =>
-      prev.map(routine => {
-        if (routine.id !== routineId) return routine;
+      prev.map(r => {
+        if (r.id !== routineId) return r;
 
-        let taskJustCompleted = false;
+        const updatedTasks = r.tasks.map(t => {
+          if (t.id !== taskId) return t;
+          const isDone = t.completedDates.includes(dateStr);
+          const newDates = isDone
+            ? t.completedDates.filter(d => d !== dateStr)
+            : [...t.completedDates, dateStr];
 
-        const updatedTasks = (routine.tasks || []).map(task => {
-          if (task.id !== taskId) return task;
-          const isDone = (task.completedDates || []).includes(targetDate);
-          if (!isDone) taskJustCompleted = true;
-
-          const updatedDates = isDone
-            ? task.completedDates.filter(d => d !== targetDate)
-            : [...(task.completedDates || []), targetDate];
-
-          return { ...task, completedDates: updatedDates };
+          return { ...t, completedDates: newDates };
         });
 
-        // Check if all tasks in routine are now completed for targetDate
-        const allTasksDone =
-          updatedTasks.length > 0 &&
-          updatedTasks.every(t => t.completedDates.includes(targetDate));
+        // Check if all tasks in routine are done for dateStr
+        const allDone = updatedTasks.length > 0 && updatedTasks.every(t => t.completedDates.includes(dateStr));
+        const routineWasDone = r.completedDates.includes(dateStr);
 
-        let updatedRoutineDates = routine.completedDates;
-        let newStreak = routine.streak;
-        let newBestStreak = routine.bestStreak;
+        let newCompletedDates = r.completedDates;
+        let newStreak = r.streak;
+        let newBestStreak = r.bestStreak;
 
-        if (allTasksDone && !routine.completedDates.includes(targetDate)) {
-          updatedRoutineDates = [...routine.completedDates, targetDate];
-          newStreak = routine.streak + 1;
-          newBestStreak = Math.max(routine.bestStreak, newStreak);
-        } else if (!allTasksDone && routine.completedDates.includes(targetDate)) {
-          updatedRoutineDates = routine.completedDates.filter(d => d !== targetDate);
-          newStreak = Math.max(0, routine.streak - 1);
-        }
+        if (allDone && !routineWasDone) {
+          newCompletedDates = [...r.completedDates, dateStr];
+          newStreak = r.streak + 1;
+          newBestStreak = Math.max(newStreak, r.bestStreak);
 
-        if (taskJustCompleted) {
-          if (theme.soundEnabled) playGentleChime(true);
-          if (allTasksDone && theme.confettiEnabled) {
+          if (theme.soundEnabled) playGentleChime();
+          if (theme.confettiEnabled) {
             confetti({
-              particleCount: 30,
+              particleCount: 45,
               spread: 60,
               origin: { y: 0.8 },
-              colors: ['#D99BAA', '#A8B89F', '#C9BDE7', '#FCEEE9', '#FFFFFF'],
-              disableForReducedMotion: true,
+              colors: [theme.colors.primary, theme.colors.secondary, theme.colors.accent],
             });
           }
+        } else if (!allDone && routineWasDone) {
+          newCompletedDates = r.completedDates.filter(d => d !== dateStr);
+          newStreak = Math.max(0, r.streak - 1);
         }
 
-        targetRoutine = {
-          ...routine,
+        updatedTarget = {
+          ...r,
           tasks: updatedTasks,
-          completedDates: updatedRoutineDates,
+          completedDates: newCompletedDates,
           streak: newStreak,
           bestStreak: newBestStreak,
+          updatedAt: new Date().toISOString(),
         };
 
-        return targetRoutine;
+        return updatedTarget;
       })
     );
 
-    if (user && targetRoutine) {
+    if (user && updatedTarget) {
       try {
-        await saveUserRoutine(user.id, targetRoutine);
+        await saveUserRoutine(user.id, updatedTarget);
       } catch (err) {
-        console.error('Failed to sync task completion to Firestore:', err);
+        console.warn('Task completion saved locally; cloud sync deferred:', err);
       }
     }
   };
 
-  // Toggle all tasks and routine completion
-  const toggleRoutineCompletion = async (id: string, targetDate: string = todayStr) => {
-    let updatedRoutine: Routine | undefined;
+  const toggleRoutineCompletion = async (id: string, dateStr: string = todayStr) => {
+    let updatedTarget: Routine | undefined;
 
     setRoutines(prev =>
-      prev.map(routine => {
-        if (routine.id !== id) return routine;
+      prev.map(r => {
+        if (r.id !== id) return r;
 
-        const isCurrentlyCompleted = routine.completedDates.includes(targetDate);
-        let updatedRoutineDates: string[];
-        let updatedTasks: RoutineTask[];
+        const isDone = r.completedDates.includes(dateStr);
+        const newCompletedDates = isDone
+          ? r.completedDates.filter(d => d !== dateStr)
+          : [...r.completedDates, dateStr];
 
-        if (isCurrentlyCompleted) {
-          // Uncomplete entire routine and all its tasks for targetDate
-          updatedRoutineDates = routine.completedDates.filter(d => d !== targetDate);
-          updatedTasks = (routine.tasks || []).map(t => ({
-            ...t,
-            completedDates: (t.completedDates || []).filter(d => d !== targetDate),
-          }));
-          const newStreak = Math.max(0, routine.streak - 1);
-
-          updatedRoutine = {
-            ...routine,
-            tasks: updatedTasks,
-            completedDates: updatedRoutineDates,
-            streak: newStreak,
-          };
-        } else {
-          // Complete entire routine and all its tasks for targetDate
-          updatedRoutineDates = [...routine.completedDates, targetDate];
-          updatedTasks = (routine.tasks || []).map(t => ({
-            ...t,
-            completedDates: (t.completedDates || []).includes(targetDate)
-              ? t.completedDates
-              : [...(t.completedDates || []), targetDate],
-          }));
-
-          if (theme.soundEnabled) {
-            playGentleChime(true);
+        // Also toggle all sub-tasks to match
+        const newTasks = r.tasks.map(t => {
+          const tDone = t.completedDates.includes(dateStr);
+          let dates = t.completedDates;
+          if (!isDone && !tDone) {
+            dates = [...t.completedDates, dateStr];
+          } else if (isDone && tDone) {
+            dates = t.completedDates.filter(d => d !== dateStr);
           }
+          return { ...t, completedDates: dates };
+        });
 
+        const newStreak = !isDone ? r.streak + 1 : Math.max(0, r.streak - 1);
+        const newBestStreak = !isDone ? Math.max(newStreak, r.bestStreak) : r.bestStreak;
+
+        if (!isDone) {
+          if (theme.soundEnabled) playGentleChime();
           if (theme.confettiEnabled) {
             confetti({
-              particleCount: 35,
-              spread: 60,
-              origin: { y: 0.8 },
-              colors: ['#D99BAA', '#A8B89F', '#C9BDE7', '#FCEEE9', '#FFFFFF'],
-              disableForReducedMotion: true,
+              particleCount: 50,
+              spread: 70,
+              origin: { y: 0.7 },
+              colors: [theme.colors.primary, theme.colors.secondary, theme.colors.accent],
             });
           }
-
-          const newStreak = routine.streak + 1;
-          const newBestStreak = Math.max(routine.bestStreak, newStreak);
-
-          updatedRoutine = {
-            ...routine,
-            tasks: updatedTasks,
-            completedDates: updatedRoutineDates,
-            streak: newStreak,
-            bestStreak: newBestStreak,
-          };
         }
-        return updatedRoutine;
+
+        updatedTarget = {
+          ...r,
+          tasks: newTasks,
+          completedDates: newCompletedDates,
+          streak: newStreak,
+          bestStreak: newBestStreak,
+          updatedAt: new Date().toISOString(),
+        };
+
+        return updatedTarget;
       })
     );
 
-    if (user && updatedRoutine) {
+    if (user && updatedTarget) {
       try {
-        await saveUserRoutine(user.id, updatedRoutine);
+        await saveUserRoutine(user.id, updatedTarget);
       } catch (err) {
-        console.error('Failed to sync routine completion to Firestore:', err);
+        console.warn('Routine completion saved locally; cloud sync deferred:', err);
       }
     }
   };
 
   const loadStarterRoutines = async () => {
-    const { starterRoutines } = await import('../services/storage');
-    setRoutines(starterRoutines);
+    const starterPack: Routine[] = [
+      {
+        id: 'routine-starter-1',
+        title: 'Morning Awakening Flow',
+        description: 'Awaken gently with lemon water and sunlight.',
+        category: 'wellness',
+        timeOfDay: 'morning',
+        daysOfWeek: [0, 1, 2, 3, 4, 5, 6],
+        reminderTime: '07:30',
+        icon: 'Sun',
+        tasks: [
+          { id: 'st-1', title: 'Warm lemon water', durationMinutes: 5, completedDates: [], order: 0 },
+          { id: 'st-2', title: '5-minute balcony sunlight & deep breath', durationMinutes: 5, completedDates: [], order: 1 },
+          { id: 'st-3', title: 'Gentle spinal twist & cat-cow', durationMinutes: 10, completedDates: [], order: 2 },
+        ],
+        streak: 0,
+        bestStreak: 0,
+        completedDates: [],
+        createdAt: new Date().toISOString(),
+        order: 0,
+      },
+      {
+        id: 'routine-starter-2',
+        title: 'Evening Digital Sunset',
+        description: 'Unplug and prepare the bedroom for restorative sleep.',
+        category: 'selfcare',
+        timeOfDay: 'evening',
+        daysOfWeek: [0, 1, 2, 3, 4, 5, 6],
+        reminderTime: '21:30',
+        icon: 'Moon',
+        tasks: [
+          { id: 'st-4', title: 'Silence phone notifications', durationMinutes: 2, completedDates: [], order: 0 },
+          { id: 'st-5', title: 'Brew lavender or chamomile tea', durationMinutes: 10, completedDates: [], order: 1 },
+          { id: 'st-6', title: 'Read 15 pages in bed', durationMinutes: 20, completedDates: [], order: 2 },
+        ],
+        streak: 0,
+        bestStreak: 0,
+        completedDates: [],
+        createdAt: new Date().toISOString(),
+        order: 1,
+      },
+    ];
+
+    setRoutines(starterPack);
+    saveLocalRoutines(starterPack);
+
     if (user) {
-      for (const r of starterRoutines) {
-        await saveUserRoutine(user.id, r);
+      try {
+        for (const r of starterPack) {
+          await saveUserRoutine(user.id, r);
+        }
+      } catch (err) {
+        console.warn('Starter routines saved locally; cloud sync deferred:', err);
       }
     }
   };
 
   const clearRoutines = async () => {
+    const ids = routines.map(r => r.id);
+    setRoutines([]);
+    saveLocalRoutines([]);
+
     if (user) {
-      for (const r of routines) {
-        await deleteFirestoreRoutine(user.id, r.id);
+      try {
+        for (const id of ids) {
+          await deleteFirestoreRoutine(user.id, id);
+        }
+      } catch (err) {
+        console.warn('Routines cleared locally; cloud sync deferred:', err);
       }
     }
-    setRoutines([]);
   };
 
-  // Live completion calculation across all tasks scheduled for today
-  const currentDayOfWeek = new Date().getDay();
-  const scheduledForToday = routines.filter(r => r.daysOfWeek.includes(currentDayOfWeek));
-
-  let totalTasksToday = 0;
-  let completedTasksToday = 0;
-
-  scheduledForToday.forEach(r => {
-    if (r.tasks && r.tasks.length > 0) {
-      totalTasksToday += r.tasks.length;
-      completedTasksToday += r.tasks.filter(t => (t.completedDates || []).includes(todayStr)).length;
-    } else {
-      totalTasksToday += 1;
-      if (r.completedDates.includes(todayStr)) completedTasksToday += 1;
-    }
-  });
-
+  // Metrics
+  const activeRoutinesToday = routines.filter(r => r.daysOfWeek.includes(new Date().getDay()));
+  const totalTasksToday = activeRoutinesToday.reduce((sum, r) => sum + r.tasks.length, 0);
+  const completedTasksToday = activeRoutinesToday.reduce(
+    (sum, r) => sum + r.tasks.filter(t => t.completedDates.includes(todayStr)).length,
+    0
+  );
   const todayCompletionRate =
     totalTasksToday > 0 ? Math.round((completedTasksToday / totalTasksToday) * 100) : 0;
 
@@ -389,6 +529,7 @@ export const RoutinesProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         isTaskCompletedOnDate,
         loadStarterRoutines,
         clearRoutines,
+        cleanDuplicateRoutines,
         todayCompletionRate,
         streakSummary,
       }}

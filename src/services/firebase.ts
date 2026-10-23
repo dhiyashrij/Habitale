@@ -17,25 +17,25 @@ import type { FirebaseConfigState } from '../types';
  * so Vite's compiler can statically replace environment variables in the bundle.
  */
 const rawApiKey = (
-  import.meta.env.VITE_FIREBASE_API_KEY || 'AIzaSyAPwy2Vts5U8XscJY9C1bYFQiHeg46BDMY'
+  import.meta.env?.VITE_FIREBASE_API_KEY || 'AIzaSyAPwy2Vts5U8XscJY9C1bYFQiHeg46BDMY'
 ).trim();
-const rawProjectId = (import.meta.env.VITE_FIREBASE_PROJECT_ID || 'habitale28').trim();
+const rawProjectId = (import.meta.env?.VITE_FIREBASE_PROJECT_ID || 'habitale28').trim();
 const rawAuthDomain = (
-  import.meta.env.VITE_FIREBASE_AUTH_DOMAIN ||
+  import.meta.env?.VITE_FIREBASE_AUTH_DOMAIN ||
   (rawProjectId ? `${rawProjectId}.firebaseapp.com` : 'habitale28.firebaseapp.com')
 ).trim();
 const rawStorageBucket = (
-  import.meta.env.VITE_FIREBASE_STORAGE_BUCKET ||
+  import.meta.env?.VITE_FIREBASE_STORAGE_BUCKET ||
   (rawProjectId ? `${rawProjectId}.firebasestorage.app` : 'habitale28.firebasestorage.app')
 ).trim();
 const rawMessagingSenderId = (
-  import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || '307858457867'
+  import.meta.env?.VITE_FIREBASE_MESSAGING_SENDER_ID || '307858457867'
 ).trim();
 const rawAppId = (
-  import.meta.env.VITE_FIREBASE_APP_ID || '1:307858457867:web:a5550425304505e491ce0e'
+  import.meta.env?.VITE_FIREBASE_APP_ID || '1:307858457867:web:a5550425304505e491ce0e'
 ).trim();
 const rawMeasurementId = (
-  import.meta.env.VITE_FIREBASE_MEASUREMENT_ID || 'G-JE6H9V8MX2'
+  import.meta.env?.VITE_FIREBASE_MEASUREMENT_ID || 'G-JE6H9V8MX2'
 ).trim();
 
 // A valid Firebase API key must be non-empty and not a placeholder string

@@ -11,11 +11,21 @@ import {
   Compass,
   Check,
   CheckCircle2,
+  AlertCircle,
+  Loader2,
 } from 'lucide-react';
 
 interface OnboardingPageProps {
   onComplete: () => void;
 }
+
+const MORNING_INSPIRATIONS: { id: string; title: string; category: RoutineCategory; duration: number; time: TimeOfDay }[] = [
+  { id: 'lemon-water', title: 'Morning Lemon Water & Sunlight', category: 'wellness', duration: 5, time: 'morning' },
+  { id: 'mat-stretch', title: 'Gentle Morning Mat Stretch', category: 'fitness', duration: 10, time: 'morning' },
+  { id: 'quiet-reading', title: '15-Minute Quiet Reading', category: 'mindfulness', duration: 15, time: 'morning' },
+  { id: 'gratitude-journal', title: 'Evening Gratitude & Journal', category: 'selfcare', duration: 10, time: 'evening' },
+  { id: 'afternoon-walk', title: 'Fresh Air Afternoon Walk', category: 'wellness', duration: 15, time: 'afternoon' },
+];
 
 const CATEGORIES: { id: RoutineCategory; label: string }[] = [
   { id: 'wellness', label: 'Wellness' },
@@ -44,6 +54,10 @@ export const OnboardingPage: React.FC<OnboardingPageProps> = ({ onComplete }) =>
   const [routineCategory, setRoutineCategory] = useState<RoutineCategory>('wellness');
   const [routineTime, setRoutineTime] = useState<TimeOfDay>('morning');
   const [routineDuration, setRoutineDuration] = useState<number>(10);
+  const [selectedInspirations, setSelectedInspirations] = useState<string[]>([]);
+  const [isSavingRoutine, setIsSavingRoutine] = useState<boolean>(false);
+  const [routineSaveError, setRoutineSaveError] = useState<string | null>(null);
+  const isSubmittingRoutineRef = React.useRef<boolean>(false);
   const [routineCreated, setRoutineCreated] = useState<boolean>(false);
   const [isFinishing, setIsFinishing] = useState<boolean>(false);
 
@@ -59,33 +73,93 @@ export const OnboardingPage: React.FC<OnboardingPageProps> = ({ onComplete }) =>
     setColorMode(mode);
   };
 
-  // Step 4: Create Routine
-  const handleCreateRoutine = async () => {
-    if (!routineTitle.trim()) return;
-
-    await addRoutine({
-      title: routineTitle.trim(),
-      category: routineCategory,
-      timeOfDay: routineTime,
-      daysOfWeek: [0, 1, 2, 3, 4, 5, 6],
-      icon: 'Sparkles',
-      tasks: [
-        {
-          id: 'task-1',
-          title: routineTitle.trim(),
-          durationMinutes: routineDuration,
-          order: 0,
-          completedDates: [],
-        },
-      ],
+  // Step 4: Toggle inspiration routine selection
+  const toggleInspiration = (title: string) => {
+    setRoutineSaveError(null);
+    setSelectedInspirations(prev => {
+      const exists = prev.includes(title);
+      if (exists) {
+        return prev.filter(t => t !== title);
+      } else {
+        return [...prev, title];
+      }
     });
+  };
 
-    setRoutineCreated(true);
-    setStep(5);
+  // Step 4: Create Routine with idempotency, concurrency guard, and error handling
+  const handleCreateRoutine = async () => {
+    // Gather all selected inspiration routines and/or custom routine
+    const routinesToCreate: { id: string; title: string; category: RoutineCategory; timeOfDay: TimeOfDay; duration: number }[] = [];
+
+    for (const title of selectedInspirations) {
+      const insp = MORNING_INSPIRATIONS.find(i => i.title === title);
+      const normalized = title.toLowerCase().replace(/[^a-z0-9]/g, '-').slice(0, 30);
+      const stableId = `routine-onboarding-${user?.id || 'guest'}-${normalized}`;
+      routinesToCreate.push({
+        id: stableId,
+        title,
+        category: insp?.category || 'wellness',
+        timeOfDay: insp?.time || 'morning',
+        duration: insp?.duration || 10,
+      });
+    }
+
+    const customTrimmed = routineTitle.trim();
+    if (customTrimmed && !selectedInspirations.includes(customTrimmed)) {
+      const normalized = customTrimmed.toLowerCase().replace(/[^a-z0-9]/g, '-').slice(0, 30);
+      const stableId = `routine-onboarding-${user?.id || 'guest'}-${normalized}`;
+      routinesToCreate.push({
+        id: stableId,
+        title: customTrimmed,
+        category: routineCategory,
+        timeOfDay: routineTime,
+        duration: routineDuration,
+      });
+    }
+
+    if (routinesToCreate.length === 0) return;
+
+    // Strict concurrency lock: ignore rapid double-clicks
+    if (isSubmittingRoutineRef.current || isSavingRoutine) return;
+    isSubmittingRoutineRef.current = true;
+    setIsSavingRoutine(true);
+    setRoutineSaveError(null);
+
+    try {
+      for (const r of routinesToCreate) {
+        await addRoutine({
+          id: r.id,
+          title: r.title,
+          category: r.category,
+          timeOfDay: r.timeOfDay,
+          daysOfWeek: [0, 1, 2, 3, 4, 5, 6],
+          icon: 'Sparkles',
+          tasks: [
+            {
+              id: `task-${r.id}-1`,
+              title: r.title,
+              durationMinutes: r.duration,
+              order: 0,
+              completedDates: [],
+            },
+          ],
+        });
+      }
+
+      setRoutineCreated(true);
+      setStep(5);
+    } catch (err: unknown) {
+      console.error('Failed to create onboarding routine:', err);
+      setRoutineSaveError('We could not save your routine at this moment. You can retry or skip to your dashboard.');
+    } finally {
+      isSubmittingRoutineRef.current = false;
+      setIsSavingRoutine(false);
+    }
   };
 
   // Step 4: Skip Routine
   const handleSkipRoutine = () => {
+    setRoutineSaveError(null);
     setRoutineCreated(false);
     setStep(5);
   };
@@ -94,11 +168,15 @@ export const OnboardingPage: React.FC<OnboardingPageProps> = ({ onComplete }) =>
   const handleLaunchDashboard = async () => {
     setIsFinishing(true);
     try {
+      const initialTitle = routineCreated
+        ? (routineTitle.trim() || selectedInspirations[0] || 'Morning Ritual')
+        : undefined;
+
       await completeOnboarding({
         displayName: user?.displayName,
         starterTheme: selectedTheme,
         colorMode: selectedMode,
-        initialRoutineTitle: routineCreated ? routineTitle.trim() : undefined,
+        initialRoutineTitle: initialTitle,
       });
       onComplete();
     } catch (err) {
@@ -279,7 +357,7 @@ export const OnboardingPage: React.FC<OnboardingPageProps> = ({ onComplete }) =>
               }}
             >
               {Object.entries(THEME_PRESETS)
-                .filter(([_, preset]) => preset.mode !== 'dark')
+                .filter(([, preset]) => preset.mode !== 'dark')
                 .map(([key, preset]) => {
                   const isSelected = selectedTheme === key;
                   return (
@@ -533,8 +611,47 @@ export const OnboardingPage: React.FC<OnboardingPageProps> = ({ onComplete }) =>
               </p>
             </div>
 
-            {/* Quick Inspiration Pills */}
-            <div style={{ marginBottom: '18px' }}>
+            {/* Error Banner if saving fails */}
+            {routineSaveError && (
+              <div
+                style={{
+                  padding: '12px 16px',
+                  borderRadius: 'var(--radius-sm)',
+                  backgroundColor: 'rgba(239, 68, 68, 0.08)',
+                  border: '1px solid rgba(239, 68, 68, 0.25)',
+                  color: '#B91C1C',
+                  fontSize: '0.86rem',
+                  marginBottom: '18px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: '12px',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <AlertCircle size={18} style={{ flexShrink: 0 }} />
+                  <span>{routineSaveError}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleCreateRoutine}
+                  style={{
+                    fontSize: '0.8rem',
+                    fontWeight: 600,
+                    textDecoration: 'underline',
+                    background: 'none',
+                    border: 'none',
+                    color: '#B91C1C',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Retry
+                </button>
+              </div>
+            )}
+
+            {/* Quick Inspiration Pills with Multi-Selection Support */}
+            <div style={{ marginBottom: '22px' }}>
               <label
                 style={{
                   display: 'block',
@@ -546,46 +663,51 @@ export const OnboardingPage: React.FC<OnboardingPageProps> = ({ onComplete }) =>
                   marginBottom: '8px',
                 }}
               >
-                Inspiration ideas:
+                Select one or more starter rituals:
               </label>
               <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                {[
-                  'Morning Lemon Water & Sunlight',
-                  '15-Minute Quiet Reading',
-                  'Gentle Morning Mat Stretch',
-                  'Evening Gratitude & Journal',
-                  'Fresh Air Afternoon Walk',
-                ].map(idea => (
-                  <button
-                    key={idea}
-                    type="button"
-                    onClick={() => setRoutineTitle(idea)}
-                    style={{
-                      fontSize: '0.78rem',
-                      padding: '4px 10px',
-                      borderRadius: 'var(--radius-pill)',
-                      backgroundColor: 'var(--card-bg)',
-                      border: '1px solid var(--card-border)',
-                      color: 'var(--text-main)',
-                      cursor: 'pointer',
-                    }}
-                  >
-                    + {idea}
-                  </button>
-                ))}
+                {MORNING_INSPIRATIONS.map(item => {
+                  const isSelected = selectedInspirations.includes(item.title);
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => toggleInspiration(item.title)}
+                      style={{
+                        fontSize: '0.82rem',
+                        padding: '6px 12px',
+                        borderRadius: 'var(--radius-pill)',
+                        backgroundColor: isSelected ? 'var(--primary-light)' : 'var(--card-bg)',
+                        border: isSelected ? '1.5px solid var(--primary)' : '1px solid var(--card-border)',
+                        color: isSelected ? 'var(--primary)' : 'var(--text-main)',
+                        fontWeight: isSelected ? 600 : 400,
+                        cursor: 'pointer',
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '6px',
+                        transition: 'all 0.2s ease',
+                      }}
+                    >
+                      {isSelected ? <Check size={14} /> : '+'} {item.title}
+                    </button>
+                  );
+                })}
               </div>
             </div>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', marginBottom: '28px' }}>
               <div>
                 <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-main)', marginBottom: '6px' }}>
-                  Routine Title *
+                  Or write a custom routine title
                 </label>
                 <input
                   type="text"
                   placeholder="e.g. Morning Matcha & 5 Minutes Stillness"
                   value={routineTitle}
-                  onChange={e => setRoutineTitle(e.target.value)}
+                  onChange={e => {
+                    setRoutineTitle(e.target.value);
+                    setRoutineSaveError(null);
+                  }}
                   style={{
                     width: '100%',
                     padding: '11px 14px',
@@ -673,13 +795,19 @@ export const OnboardingPage: React.FC<OnboardingPageProps> = ({ onComplete }) =>
             </div>
 
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <button onClick={() => setStep(3)} className="btn btn-outline">
+              <button
+                type="button"
+                onClick={() => setStep(3)}
+                disabled={isSavingRoutine}
+                className="btn btn-outline"
+              >
                 Back
               </button>
               <div style={{ display: 'flex', gap: '10px' }}>
                 <button
                   type="button"
                   onClick={handleSkipRoutine}
+                  disabled={isSavingRoutine}
                   className="btn btn-ghost"
                   style={{ color: 'var(--text-muted)' }}
                 >
@@ -688,11 +816,21 @@ export const OnboardingPage: React.FC<OnboardingPageProps> = ({ onComplete }) =>
                 <button
                   type="button"
                   onClick={handleCreateRoutine}
-                  disabled={!routineTitle.trim()}
+                  disabled={(!routineTitle.trim() && selectedInspirations.length === 0) || isSavingRoutine}
                   className="btn btn-primary"
+                  style={{ minWidth: '160px', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}
                 >
-                  <span>Save & Continue</span>
-                  <ArrowRight size={16} />
+                  {isSavingRoutine ? (
+                    <>
+                      <Loader2 size={16} className="animate-spin" />
+                      <span>Saving...</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>Save & Continue</span>
+                      <ArrowRight size={16} />
+                    </>
+                  )}
                 </button>
               </div>
             </div>
